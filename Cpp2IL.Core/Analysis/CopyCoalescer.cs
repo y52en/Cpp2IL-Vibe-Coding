@@ -9,12 +9,27 @@ namespace Cpp2IL.Core.Analysis;
 // Merge the copies left behind by SSA destruction.
 public static class CopyCoalescer
 {
-    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!);
+    public static void Run(MethodAnalysisContext method) => Run(method.ControlFlowGraph!, new HashSet<LocalVariable>(method.ParameterLocals));
 
-    public static void Run(ISILControlFlowGraph cfg)
+    public static void Run(ISILControlFlowGraph cfg) => Run(cfg, []);
+
+    private static void Run(ISILControlFlowGraph cfg, HashSet<LocalVariable> inputs)
     {
-        var copies = FindSameSlotCopies(cfg);
-        var escapedSlots = FindEscapedSlotGroups(cfg);
+        // Inputs are IL arguments, not local storage. Even choosing the input as
+        // representative is unsafe: later assignments are emitted as stloc while
+        // reads of the argument are emitted as ldarg. Keep the explicit copy.
+        foreach (var instruction in cfg.Instructions)
+            foreach (var local in Used(instruction))
+                if (local.IsThis || local.IsMethodInfo)
+                    inputs.Add(local);
+
+        var mutableStructs = SsaSimplifier.MutableStructStorage(cfg);
+        var copies = FindSameSlotCopies(cfg)
+            .Where(copy => !inputs.Contains(copy.Destination) && !inputs.Contains(copy.Source)
+                && !SsaSimplifier.PreserveStructCopy(copy.Destination, copy.Source, mutableStructs)).ToList();
+        var escapedSlots = FindEscapedSlotGroups(cfg)
+            .Select(group => group.Where(local => !inputs.Contains(local)).ToList())
+            .Where(group => group.Count > 1).ToList();
 
         if (copies.Count == 0 && escapedSlots.Count == 0)
             return;
@@ -283,7 +298,7 @@ public static class CopyCoalescer
                             instruction.SetOperand(i, memory); // MemoryOperand is a struct, write the copy back
                             break;
                         case FieldReference field:
-                            field.Local = groups.Find(field.Local);
+                            field.ReplaceLocal(field.Local, groups.Find(field.Local));
                             break;
                         case ArrayAccess array:
                             array.Array = groups.Find(array.Array);
