@@ -8,12 +8,93 @@ using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
 using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Model.Contexts;
 
 namespace Cpp2IL.Core.Tests.Analysis;
 
 public class ParameterEmissionIdentityTests
 {
+    [TestCase("sparse-static")]
+    [TestCase("sparse-instance")]
+    [TestCase("reordered")]
+    [TestCase("missing-middle")]
+    [TestCase("unindexed-partial")]
+    [TestCase("invalid-ordinal")]
+    [TestCase("mixed-indexed")]
+    [TestCase("complete-legacy")]
+    public void ParameterTypingUsesOriginalOrdinalsInsteadOfCompactingSurvivingLocals(string shape)
+    {
+        var t = TestGameLoader.LoadSimple2019Game().SystemTypes;
+        var byref = new ByRefTypeAnalysisContext(t.SystemBooleanType);
+        var context = new InjectedMethodAnalysisContext(t.SystemObjectType, "Typed", t.SystemVoidType,
+            MethodAttributes.Public | (shape == "sparse-instance" ? 0 : MethodAttributes.Static),
+            [t.SystemStringType, byref, t.SystemDoubleType], ["unused", "output", "number"]);
+        var first = new LocalVariable("same_name", new Register(null, "first")) { ParameterIndex = 0 };
+        var second = new LocalVariable("same_name", new Register(null, "second")) { ParameterIndex = 1 };
+        var third = new LocalVariable("same_name", new Register(null, "third")) { ParameterIndex = 2 };
+        context.ParameterLocals = [second];
+        if (shape == "reordered") context.ParameterLocals = [third, second];
+        if (shape == "missing-middle") context.ParameterLocals = [first, third];
+        if (shape == "sparse-instance") context.ParameterLocals =
+            [new("renamed_this", new Register(null, "this")) { IsThis = true }, second,
+                new("renamed_info", new Register(null, "info")) { IsMethodInfo = true }];
+        if (shape == "unindexed-partial") second.ParameterIndex = -1;
+        if (shape == "invalid-ordinal") second.ParameterIndex = 3;
+        if (shape is "mixed-indexed" or "complete-legacy")
+        {
+            context.ParameterLocals = [first, second, third]; second.ParameterIndex = -1;
+            if (shape == "complete-legacy") first.ParameterIndex = third.ParameterIndex = -1;
+        }
+        typeof(LocalVariables).GetMethod("PropagateFromParameters", BindingFlags.NonPublic | BindingFlags.Static)!
+            .Invoke(null, [context]);
+        Assert.That(second.Type, Is.SameAs<TypeAnalysisContext>(shape is "unindexed-partial" or "invalid-ordinal" or "mixed-indexed" or "missing-middle" ? null : byref));
+        if (shape is "reordered" or "missing-middle" or "mixed-indexed" or "complete-legacy")
+            Assert.That(third.Type, Is.SameAs(t.SystemDoubleType));
+        if (shape is "missing-middle" or "mixed-indexed" or "complete-legacy")
+            Assert.That(first.Type, Is.SameAs(t.SystemStringType));
+    }
+
+    [TestCase("unused input")]
+    [TestCase(null)]
+    public void GeneratedMethodWritesTheActualOutBooleanWhenEarlierArgumentIsUnused(string? unused)
+    {
+        var t = TestGameLoader.LoadSimple2019Game().SystemTypes;
+        // Production exports the type table before emitting stobj. This detached
+        // runtime fixture supplies the primitive definition it needs explicitly.
+        var runtimeModule = ModuleDefinition.FromFile(typeof(bool).Assembly.Location);
+        t.SystemBooleanType.PutExtraData("AsmResolverType",
+            runtimeModule.GetAllTypes().Single(type => type.FullName == "System.Boolean"));
+        var byref = new ByRefTypeAnalysisContext(t.SystemBooleanType);
+        var output = new LocalVariable("renamed_output", new Register(null, "X1")) { ParameterIndex = 1 };
+        var context = new InjectedMethodAnalysisContext(t.SystemObjectType, "Run", t.SystemBooleanType,
+            MethodAttributes.Public | MethodAttributes.Static, [t.SystemStringType, byref], ["unused", "output"])
+        {
+            ParameterLocals = [output], Locals = [output], AnalysisWarnings = [],
+            ControlFlowGraph = new([new(0, OpCode.Move, new MemoryOperand(output), new Immediate(0)) { NativeWriteSize = 1 },
+                new(1, OpCode.Return, new Immediate(0))])
+        };
+        LocalVariables.ResolveTypesAndFields(context);
+        Assert.That(output.Type, Is.SameAs(byref));
+        // Follow the production ARM64 pass order before emitting the pointer
+        // store, rather than trying to emit Boolean's private storage field.
+        Assert.That(PrimitiveByRefStorageRecovery.Recover(context), Is.EqualTo(1));
+        var (module, owner) = Module();
+        var method = new MethodDefinition("Run", AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Public
+            | AsmResolver.PE.DotNet.Metadata.Tables.MethodAttributes.Static,
+            MethodSignature.CreateStatic(module.CorLibTypeFactory.Boolean,
+                [module.CorLibTypeFactory.String, new ByReferenceTypeSignature(module.CorLibTypeFactory.Boolean)]));
+        owner.Methods.Add(method);
+        method.ParameterDefinitions.Add(new ParameterDefinition(1, "unused_renamed", 0));
+        method.ParameterDefinitions.Add(new ParameterDefinition(2, "output_renamed", 0));
+        IlGenerator.GenerateIl(context, method);
+        Assert.That(method.CilMethodBody!.Instructions.Count(instruction => instruction.OpCode == CilOpCodes.Stobj), Is.EqualTo(1));
+        Assert.That(method.CilMethodBody.Instructions.Any(instruction => instruction.OpCode == CilOpCodes.Stfld), Is.False);
+        object?[] arguments = [unused, true];
+        Assert.That(Load(module).Invoke(null, arguments), Is.EqualTo(false));
+        Assert.That(arguments[1], Is.EqualTo(false), "The real out argument, rather than a string-typed local, must be written");
+    }
+
     static readonly MethodInfo Emit=typeof(IlGenerator).GetMethod("GenerateInstructions",BindingFlags.NonPublic|BindingFlags.Static)!;
     static (ModuleDefinition Module,TypeDefinition Owner) Module()
     {

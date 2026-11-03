@@ -305,7 +305,7 @@ public static class IlGenerator
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
     private static string Diagnostic(string message) 
-        => message.Length <= 250 ? message : message[..250] + "…";
+        => message.Length <= 250 ? message : message[..250] + "窶ｦ";
     
     private static Block? TryResolveJumpTargetBlock(Instruction jumpInstruction, ISILControlFlowGraph cfg)
     {
@@ -758,6 +758,8 @@ public static class IlGenerator
                 var comparison = instruction.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual
                     or OpCode.CheckLess or OpCode.CheckGreater or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual;
                 var comparisonType=comparison?ComparisonStackType(instruction):null;
+                var floatingComparison = comparison && instruction.Operands.Skip(1).Any(o =>
+                    o is FloatLiteral or DoubleLiteral || DestinationType(o)?.FullName is "System.Single" or "System.Double");
                 var nativeArithmeticType=NativeIntegerArithmeticType(instruction,context);
 
                 if(nativeArithmeticType!=null)
@@ -791,15 +793,15 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Ceq);
                         break;
-                    // a >= b  ==  !(a < b)
+                    // Ordered floating >= must negate unordered-or-less; NaN is false.
                     case OpCode.CheckGreaterOrEqual:
-                        instructions.Add(instruction.UnsignedComparison ? CilOpCodes.Clt_Un : CilOpCodes.Clt);
+                        instructions.Add(instruction.UnsignedComparison || floatingComparison ? CilOpCodes.Clt_Un : CilOpCodes.Clt);
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Ceq);
                         break;
-                    // a <= b  ==  !(a > b)
+                    // Ordered floating <= must negate unordered-or-greater; NaN is false.
                     case OpCode.CheckLessOrEqual:
-                        instructions.Add(instruction.UnsignedComparison ? CilOpCodes.Cgt_Un : CilOpCodes.Cgt);
+                        instructions.Add(instruction.UnsignedComparison || floatingComparison ? CilOpCodes.Cgt_Un : CilOpCodes.Cgt);
                         instructions.Add(CilOpCodes.Ldc_I4_0);
                         instructions.Add(CilOpCodes.Ceq);
                         break;
@@ -1099,7 +1101,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Conv_I4);
                 break;
             case AddressOf { Target: LocalVariable addressed }:
-                instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+                LoadLocalAddress(addressed, method, locals);
                 break;
             case AddressOf { Target: FieldReference addressedField }:
                 if (addressedField.Field.IsStatic)
@@ -1360,6 +1362,24 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldarg, parameter);
         else
             instructions.Add(CilOpCodes.Ldloc, locals[local]);
+    }
+
+    private static void LoadLocalAddress(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        if (local.IsThis)
+        {
+            if (method.Signature?.HasThis != true)
+                throw new DecompilerException("this address requested in static method");
+            // A value-type this is already a managed pointer. Taking the
+            // address of a class this instead addresses its argument slot.
+            if (local.Type?.IsValueType == true) instructions.Add(CilOpCodes.Ldarg_0);
+            else instructions.Add(CilOpCodes.Ldarga, method.Parameters.GetBySignatureIndex(0));
+            return;
+        }
+        var parameter = ParameterFor(local, method);
+        if (parameter != null) instructions.Add(CilOpCodes.Ldarga, parameter);
+        else instructions.Add(CilOpCodes.Ldloca, locals[local]);
     }
 
     private static void LoadFieldReceiver(FieldReference field,MethodDefinition method,Dictionary<LocalVariable,CilLocalVariable> locals)

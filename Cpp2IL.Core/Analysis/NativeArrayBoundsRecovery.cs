@@ -159,6 +159,51 @@ public static class NativeArrayBoundsRecovery
     private static bool Scalar(TypeAnalysisContext type)=>type.FullName is "System.Single" or "System.Double"
         or "System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64";
 
+    private record WidenedIndex(LocalVariable Root,LocalVariable Narrow,Instruction Narrowing,Instruction Widening);
+
+    // A native W-register range test can guard an SXTW array address. The
+    // decoded address is (long)(int)index, not an independent 64-bit index.
+    // Recognize only that explicit conversion pair in this same guard. A
+    // successful unsigned 32-bit test against a managed length proves the
+    // value is nonnegative and <= Int32.MaxValue, so the narrow view is exact.
+    private static WidenedIndex? GuardedWidenedIndex(MethodAnalysisContext method,Block guard,ArrayAccess access,
+        Dictionary<LocalVariable,Instruction> defs)
+    {
+        if(access.Index is not LocalVariable {Type.FullName:"System.Int64"} wide
+            || !defs.TryGetValue(wide,out var widening)
+            || widening is not {OpCode:OpCode.NumericConvert,NativeFloatingPointSize:0,
+                Operands:[_,TypeAnalysisContext {FullName:"System.Int64"},TypeAnalysisContext {FullName:"System.Int32"},
+                    LocalVariable {Type.FullName:"System.Int32"} narrow]}
+            || !defs.TryGetValue(narrow,out var narrowing)
+            || narrowing is not {OpCode:OpCode.NumericConvert,NativeFloatingPointSize:0,
+                Operands:[_,TypeAnalysisContext {FullName:"System.Int32"},TypeAnalysisContext from,
+                    LocalVariable {Type.FullName:"System.Int32" or "System.UInt32"} root]}
+            || from.FullName is not ("System.Int32" or "System.UInt32" or "System.Int64" or "System.UInt64")
+            || from.FullName is "System.Int64" or "System.UInt64" && !narrowing.NativeIntegerSourceView
+            || !guard.Instructions.Contains(narrowing) || !guard.Instructions.Contains(widening)
+            || guard.Instructions.IndexOf(narrowing)>=guard.Instructions.IndexOf(widening)
+            || guard.Instructions.IndexOf(widening)>=guard.Instructions.Count-1
+            || guard.Instructions.Any(i=>ReferenceEquals(i.Destination,root)))return null;
+        var graph=method.ControlFlowGraph!;
+        // Post-SSA induction variables can have writes on the backedge. They
+        // need not have a single global definition: no write/call is permitted
+        // between this guard's length read and its immediate managed access.
+        // Address exposure could invalidate that local-value proof anywhere.
+        bool Exposed(IOperand operand)=>operand switch {
+            AddressOf a=>ForwardNullCheckRecovery.Uses(a.Target,root),
+            MemoryOperand m=>ForwardNullCheckRecovery.Uses(m,root),
+            FieldReference f=>ReferenceEquals(f.Local,root) || f.Parent!=null && Exposed(f.Parent),
+            ArrayAccess a=>Exposed(a.Index),_=>false};
+        if(graph.Instructions.Any(i=>i.Operands.Any(Exposed)
+            || i.IsCall && i.Operands.OfType<MethodAnalysisContext>().Any(m=>m.Parameters.Any(p=>p.ParameterType is ByRefTypeAnalysisContext))
+                && i.Operands.Any(o=>ForwardNullCheckRecovery.Uses(o,root))))return null;
+        int Occurrences(IOperand operand)=>operand switch {
+            ArrayAccess a=>ReferenceEquals(a,access)?1:0,
+            AddressOf a=>Occurrences(a.Target),_=>0};
+        if(graph.Instructions.Sum(i=>i.Operands.Sum(Occurrences))!=1)return null;
+        return new(root,narrow,narrowing,widening);
+    }
+
     internal static bool TryRecover(MethodAnalysisContext method,Block guard,Func<Instruction,bool> prove)
     {
         var cfg=method.ControlFlowGraph!;
@@ -171,11 +216,14 @@ public static class NativeArrayBoundsRecovery
         if(failures.Count!=1)return false;
         var failure=failures[0];var success=guard.Successors.Single(b=>!ReferenceEquals(b,failure.Block));
         if(success.Predecessors.Count!=1 || NextAccess(method,success) is not {} access
-            || access.Array.Type is not SzArrayTypeAnalysisContext || !Index(access.Index))return false;
+            || access.Array.Type is not SzArrayTypeAnalysisContext)return false;
         if(cfg.Blocks.Where(b=>!failure.Region.Contains(b)).SelectMany(b=>b.Instructions).SelectMany(i=>i.Operands)
             .Any(o=>ForwardNullCheckRecovery.Uses(o,failure.Exception)))return false;
         var defs=cfg.Instructions.Where(i=>i.Destination is LocalVariable).GroupBy(i=>(LocalVariable)i.Destination!)
             .Where(g=>g.Count()==1).ToDictionary(g=>g.Key,g=>g.Single());
+        var widened=GuardedWidenedIndex(method,guard,access,defs);
+        if(!Index(access.Index) && widened==null)return false;
+        var comparedIndex=widened?.Root ?? access.Index;
         var lengths=new HashSet<Instruction>();
         bool Length(IOperand operand,Instruction consumer)
         {
@@ -187,12 +235,13 @@ public static class NativeArrayBoundsRecovery
             lengths.Add(definition);return true;
         }
         var comparison=Flag(condition,defs,guard,branch,out var invert);if(comparison==null)return false;
+        if(widened!=null && comparison.NativeComparisonSize!=4)return false;
         bool? truePass=null;
         if(comparison.UnsignedComparison && comparison.Operands is [_,var left,var right])
         {
-            if(Same(left,access.Index) && Length(right,comparison))truePass=comparison.OpCode switch {
+            if(Same(left,comparedIndex) && Length(right,comparison))truePass=comparison.OpCode switch {
                 OpCode.CheckLess=>true,OpCode.CheckGreaterOrEqual=>false,_=>null};
-            else if(Same(right,access.Index) && Length(left,comparison))truePass=comparison.OpCode switch {
+            else if(Same(right,comparedIndex) && Length(left,comparison))truePass=comparison.OpCode switch {
                 OpCode.CheckGreater=>true,OpCode.CheckLessOrEqual=>false,_=>null};
         }
         // For the literal first element, unsigned index >= length is exactly
@@ -229,11 +278,12 @@ public static class NativeArrayBoundsRecovery
             return method.ParameterLocals.Contains(local)?writes.Length==0
                 :writes.Length==1 && lengths.All(length=>ForwardNullCheckRecovery.DefinitionDominates(cfg,writes[0],length));
         }
-        if(!Stable(access.Array) || access.Index is LocalVariable indexLocal && !Stable(indexLocal))return false;
+        if(!Stable(access.Array) || widened==null && access.Index is LocalVariable indexLocal && !Stable(indexLocal))return false;
         var first=lengths.Min(i=>guard.Instructions.IndexOf(i));
         foreach(var operation in guard.Instructions.Skip(first))
         {
             if(ReferenceEquals(operation,branch) || lengths.Contains(operation) || operation.OpCode==OpCode.Nop)continue;
+            if(widened!=null && (ReferenceEquals(operation,widened.Narrowing) || ReferenceEquals(operation,widened.Widening)))continue;
             if(operation.Destination is not LocalVariable destination || ReferenceEquals(destination,access.Array)
                 || ReferenceEquals(destination,access.Index)
                 || operation.OpCode is not (OpCode.Move or OpCode.Not or OpCode.And or OpCode.Subtract
@@ -241,6 +291,7 @@ public static class NativeArrayBoundsRecovery
                     or OpCode.CheckGreater or OpCode.CheckGreaterOrEqual)
                 || operation.Sources.Any(o=>o is not (LocalVariable or Immediate)))return false;
         }
+        if(widened!=null)access.Index=widened.Narrow;
         branch.OpCode=OpCode.Jump;branch.SetOperands(success);cfg.RemoveEdge(guard,failure.Block);guard.CalculateBlockType();
         DeadCodeEliminator.Run(cfg);
         // ArrayLength is normally effectful (it throws on null) and must not be

@@ -13,9 +13,15 @@ public static class NestedFieldAccess
     // A native byte range distinguishes a whole struct store from a scalar
     // store to its first field at exactly the same address.
     public static FieldReference? Find(TypeAnalysisContext owner,LocalVariable root,long offset,int width,MethodAnalysisContext? nativeMethod=null)
-        => Find(owner,root,offset,width,null,new HashSet<TypeAnalysisContext>(),8,nativeMethod);
+        => Find(owner,root,offset,width,null,new HashSet<TypeAnalysisContext>(),8,nativeMethod,false);
 
-    private static FieldReference? Find(TypeAnalysisContext owner,LocalVariable root,long offset,int width,FieldReference? parent,HashSet<TypeAnalysisContext> seen,int remaining,MethodAnalysisContext? nativeMethod)
+    // Taking a managed ref to a reference slot does not dereference the object
+    // stored in it. Allow the exact complete slot only for address consumers;
+    // ordinary memory reads retain their existing conservative contract.
+    public static FieldReference? FindAddress(TypeAnalysisContext owner,LocalVariable root,long offset,int width,MethodAnalysisContext? nativeMethod=null)
+        => Find(owner,root,offset,width,null,new HashSet<TypeAnalysisContext>(),8,nativeMethod,true);
+
+    private static FieldReference? Find(TypeAnalysisContext owner,LocalVariable root,long offset,int width,FieldReference? parent,HashSet<TypeAnalysisContext> seen,int remaining,MethodAnalysisContext? nativeMethod,bool addressOnly)
     {
         if(width<=0 || remaining<=0 || offset<0 || offset>long.MaxValue-width
             || owner.AppContext.Binary.PointerSizeBytes!=8 || !seen.Add(owner)) return null;
@@ -51,9 +57,9 @@ public static class NestedFieldAccess
         // slot, not another embedded object layout. Never descend through it
         // or reinterpret a partial pointer read as a managed reference.
         if(!field.FieldType.IsValueType)
-            return (parent!=null || owner.IsValueType) && delta==0 && width==8 ? access : null;
+            return (addressOnly || parent!=null || owner.IsValueType) && delta==0 && width==8 ? access : null;
         if(delta==0 && TypeSizes.UnboxedSize(field.FieldType,8)==width) return access;
-        return Find(field.FieldType,root,delta,width,access,seen,remaining-1,nativeMethod);
+        return Find(field.FieldType,root,delta,width,access,seen,remaining-1,nativeMethod,addressOnly);
     }
 
     private static long StorageSize(TypeAnalysisContext type)

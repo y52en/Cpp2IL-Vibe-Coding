@@ -23,7 +23,7 @@ public static class GenericInstanceFieldLayout
 
     // A per-instantiation view, never write recomputed offsets back to the
     // shared generic definition. Component access needs the WHOLE proven range.
-    public static IReadOnlyList<FieldStorage>? InheritedFields(TypeAnalysisContext owner)
+    public static IReadOnlyList<FieldStorage>? InheritedFields(TypeAnalysisContext owner, bool allowOpenReferenceFields = false)
     {
         if(owner.IsValueType)return null;
         var hierarchy = new List<TypeAnalysisContext>();
@@ -34,7 +34,7 @@ public static class GenericInstanceFieldLayout
                 return null;
             hierarchy.Add(type);
         }
-        if (!hierarchy.Any(t => t is GenericInstanceTypeAnalysisContext))
+        if (!allowOpenReferenceFields && !hierarchy.Any(t => t is GenericInstanceTypeAnalysisContext))
             return null;
         if(!ReferenceEquals(hierarchy[^1],owner.AppContext.SystemTypes.SystemObjectType))return null;
         var pointerSize = owner.AppContext.Binary.PointerSizeBytes;
@@ -55,6 +55,7 @@ public static class GenericInstanceFieldLayout
             {
                 FieldAnalysisContext field = generic == null ? original : new ConcreteGenericFieldAnalysisContext(original, generic);
                 if (field.FieldType.HasAnyGenericParameters()
+                        && !(allowOpenReferenceFields && ConstrainedReferenceFieldLayout.IsReferenceStorage(field.FieldType))
                     || GetSizeAndAlignment(field.FieldType, pointerSize) is not { } layout)
                     return null;
                 var aligned = (end + layout.Alignment - 1) & ~(layout.Alignment - 1);

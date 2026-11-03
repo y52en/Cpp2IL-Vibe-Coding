@@ -235,6 +235,7 @@ public static class LocalVariables
                 destination.Type=value.Type;
         // Seed types from fixed ground truth - the method's own signature, and type-metadata global
         // loads. Applied once up front and, being applied first, they win over anything inferred later.
+        ZeroEdgeReturnRecovery.Run(method);
         PropagateFromReturn(method);
         PropagateFromParameters(method);
         SeedRuntimeClassTypes(method);
@@ -299,6 +300,7 @@ public static class LocalVariables
             // Only after all ordinary metadata constraints settle, recover a
             // proven integral induction cycle used as a managed array index.
             if (!changed) changed = ArrayIndexInductionRecovery.Run(method);
+            if (!changed) changed = BooleanConstantPhiRecovery.Run(method) > 0;
         }
     }
 
@@ -880,17 +882,21 @@ public static class LocalVariables
             return;
 
         // Normal params
-        var paramIndex = 0;
-        foreach (var local in method.ParameterLocals)
+        var parameters = method.ParameterLocals.Where(p => !p.IsThis && !p.IsMethodInfo).ToArray();
+        // CreateAll records metadata ordinals even when earlier incoming
+        // registers are unused and have no SSA local. Never compact that
+        // sparse list back onto parameter zero. Legacy injected contexts may
+        // supply a complete, ordered, unindexed list; only that unambiguous
+        // full-list contract retains positional typing.
+        var completeUnindexed = parameters.Length == method.Parameters.Count
+            && parameters.Distinct().Count() == parameters.Length
+            && parameters.All(p => p.ParameterIndex == -1);
+        for (var i = 0; i < parameters.Length; i++)
         {
-            if (local.IsThis || local.IsMethodInfo)
-                continue;
-
-            if (paramIndex >= method.Parameters.Count)
-                break;
-
-            local.Type = method.Parameters[paramIndex].ParameterType;
-            paramIndex++;
+            var local = parameters[i];
+            var ordinal = completeUnindexed ? i : local.ParameterIndex;
+            if (ordinal < 0 || ordinal >= method.Parameters.Count) continue;
+            local.Type = method.Parameters[ordinal].ParameterType;
         }
     }
 

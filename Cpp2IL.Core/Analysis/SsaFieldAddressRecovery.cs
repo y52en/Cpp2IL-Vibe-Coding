@@ -77,6 +77,6 @@ public static class SsaFieldAddressRecovery
                 changed++;
             }
         }
-        return changed;
+        return changed + ByRefFieldArgumentRecovery.Run(method);
     }
 }

@@ -277,6 +277,16 @@ public static class MetadataResolver
                 // parameters retain their existing field/type inference path.
                 if (local.Type is CheckedUnboxRecovery.UnboxedReference && TypeSizes.IsScalarValueType(owner)) continue;
                 var nativeWidth=i==0 ? instruction.NativeWriteSize : i==1 ? instruction.NativeReadSize : 0;
+                if (staticOwner == null && owner is GenericParameterTypeAnalysisContext parameter)
+                {
+                    if (instruction.OpCode == OpCode.Move
+                        && ConstrainedReferenceFieldLayout.Find(parameter, memory.Addend, nativeWidth) is {} constrained)
+                    {
+                        instruction.SetOperand(i, new FieldReference(constrained, local, (int)memory.Addend));
+                        changed = true;
+                    }
+                    continue;
+                }
                 if(instruction.OpCode==OpCode.Move && nativeWidth>0 && staticOwner==null
                     && NestedFieldAccess.Find(owner,local,memory.Addend,nativeWidth,method) is { } nested)
                 {

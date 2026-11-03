@@ -482,6 +482,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Needs type resolved for delegate locals
         DelegateInvokeRecovery.Run(this);
         BooleanFlagSimplifier.Run(this);
+        FloatingConditionRecovery.Run(this);
+        FloatingConditionRecovery.RunValues(this);
         DeadCodeEliminator.Run(this);
 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
@@ -623,9 +625,18 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         PackedPrimitiveFieldCopyRecovery.Run(this);
         PackedScalarConstantStoreRecovery.Run(this);
         NativePublicFieldAccessorRecovery.Run(this);
+        NativeValuePropertyRecovery.Run(this);
         NativeAggregateFieldAccessorRecovery.Run(this);
         NativeSelectorCloneRecovery.Run(this);
-        LateScalarTypeRecovery.Run(this);
+        if (LateScalarTypeRecovery.Run(this) > 0)
+            NativeArrayBoundsRecovery.Run(this);
+        // Field/property and literal recovery may establish floating operands
+        // only after the early SSA proof. Reapply the identical four-outcome
+        // proof, retaining unique writes, dominance and escape rejection even
+        // though SSA has been removed. Discard only newly dead flag producers.
+        var lateFloatingBranches = FloatingConditionRecovery.Run(this);
+        if (FloatingConditionRecovery.RunValues(this) > 0 || lateFloatingBranches > 0)
+            DeadCodeEliminator.Run(this);
         SignedConstantDivisionRecovery.Run(this);
         LocalVariables.RemoveUnused(this);
     }

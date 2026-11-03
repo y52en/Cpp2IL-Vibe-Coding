@@ -40,6 +40,16 @@ public class NativeArrayBoundsRecoveryTests
     [TestCase("fresh-object-duplicate-def",false)] [TestCase("fresh-object-after-length",false)]
     [TestCase("fresh-object-wrong-allocator",false)] [TestCase("fresh-object-no-allocation",false)]
     [TestCase("fresh-object-byref-call",false)]
+    [TestCase("widened-index-direct",true)] [TestCase("widened-index-source-u32",true)]
+    [TestCase("widened-index-native64-view",true)] [TestCase("widened-index-loop",true)]
+    [TestCase("widened-index-reversed",true)] [TestCase("widened-index-effect",false)]
+    [TestCase("widened-index-signed",false)] [TestCase("widened-index-unknown-comparison",false)]
+    [TestCase("widened-index-comparison64",false)] [TestCase("widened-index-root64",false)]
+    [TestCase("widened-index-no-native-view",false)] [TestCase("widened-index-wrong-index",false)]
+    [TestCase("widened-index-wrong-conversion-order",false)] [TestCase("widened-index-wrong-widening",false)]
+    [TestCase("widened-index-mutated-root",false)] [TestCase("widened-index-escaped-root",false)]
+    [TestCase("widened-index-conversion-redefined",false)] [TestCase("widened-index-alternate-access",false)]
+    [TestCase("widened-index-duplicate-access",false)]
     public void OnlySameUnsignedArrayRangeAndAutomaticFailureCanBeImplicit(string shape,bool expected)
     {
         var t=TestGameLoader.LoadSimple2019Game().SystemTypes;
@@ -165,12 +175,57 @@ public class NativeArrayBoundsRecoveryTests
         var method=new InjectedMethodAnalysisContext(t.SystemObjectType,"Test",t.SystemVoidType,MethodAttributes.Static,[])
             {ControlFlowGraph=graph,ParameterLocals=[array,other,index,otherIndex]};
         if(fresh)method.ParameterLocals.Remove(array);
+        LocalVariable? narrowedIndex=null;
+        if(shape.StartsWith("widened-index-",System.StringComparison.Ordinal))
+        {
+            if(shape=="widened-index-source-u32" || shape is "widened-index-native64-view" or "widened-index-no-native-view")index.Type=t.SystemUInt32Type;
+            if(shape=="widened-index-root64")index.Type=t.SystemUInt64Type;
+            narrowedIndex=Local("narrowedIndex",t.SystemInt32Type);
+            var wideIndex=Local("wideIndex",t.SystemInt64Type);
+            var from=shape is "widened-index-native64-view" or "widened-index-no-native-view"?t.SystemUInt64Type:index.Type!;
+            var narrowing=new Instruction(40,OpCode.NumericConvert,narrowedIndex,t.SystemInt32Type,from,index)
+                {NativeIntegerSourceView=shape=="widened-index-native64-view"};
+            var widening=new Instruction(41,OpCode.NumericConvert,wideIndex,t.SystemInt64Type,
+                shape=="widened-index-wrong-widening"?t.SystemUInt32Type:t.SystemInt32Type,narrowedIndex);
+            access.Index=wideIndex;
+            compare.SetOperands(lower,index,length);compare.UnsignedComparison=shape!="widened-index-signed";
+            compare.NativeComparisonSize=shape=="widened-index-unknown-comparison"?0:shape=="widened-index-comparison64"?8:4;
+            branch.SetOperands(success,lower);
+            guard.Instructions=[load,narrowing,widening,compare,branch];
+            if(shape=="widened-index-reversed"){compare.SetOperands(lower,length,index);compare.OpCode=OpCode.CheckGreater;}
+            if(shape=="widened-index-effect")success.Instructions.Insert(0,new(42,OpCode.CallVoid,new StringLiteral("observe")));
+            if(shape=="widened-index-wrong-index")compare.SetOperand(1,otherIndex);
+            if(shape=="widened-index-wrong-conversion-order")guard.Instructions=[load,widening,narrowing,compare,branch];
+            if(shape=="widened-index-mutated-root")guard.Instructions.Insert(3,new(42,OpCode.Move,index,new Immediate(1)));
+            if(shape=="widened-index-escaped-root")graph.EntryBlock.Instructions.Add(new(42,OpCode.CallVoid,new StringLiteral("observe"),new AddressOf(index)));
+            if(shape=="widened-index-conversion-redefined")guard.Instructions.Insert(3,new(42,OpCode.Move,narrowedIndex,new Immediate(0)));
+            if(shape=="widened-index-alternate-access")Edge(graph.EntryBlock,success);
+            if(shape=="widened-index-duplicate-access")success.Instructions.Insert(1,new(42,OpCode.Move,Local("another",t.SystemInt32Type),access));
+            if(shape=="widened-index-loop")
+            {
+                method.ParameterLocals.Remove(index);graph.EntryBlock.Instructions=[new(42,OpCode.Move,index,new Immediate(0))];
+                graph.RemoveEdge(success,graph.ExitBlock);Edge(success,guard);
+                success.Instructions=[operation,new(43,OpCode.Add,index,index,new Immediate(1)),new(44,OpCode.Jump,guard)];
+            }
+        }
         foreach(var block in graph.Blocks)block.CalculateBlockType();
         var before=graph.Instructions.Select(i=>i.ToString()).ToArray();
         Assert.That(NativeArrayBoundsRecovery.TryRecover(method,guard,i=>i.NativeDirectCallTarget==0xaae400),Is.EqualTo(expected));
         if(!expected)Assert.That(graph.Instructions.Select(i=>i.ToString()),Is.EqualTo(before));
         else
         {
+            if(narrowedIndex!=null)
+            {
+                Assert.That(access.Index,Is.SameAs(narrowedIndex));
+                foreach(var bits in new uint[]{0,1,2,0x7fffffff,0x80000000,0xffffffff})
+                foreach(var size in new uint[]{0,1,2,0x7fffffff})
+                {
+                    var nativePass=bits<size;
+                    var signedWide=(long)unchecked((int)bits);
+                    Assert.That((ulong)signedWide<size,Is.EqualTo(nativePass),
+                        "Only successful unsigned32 bounds permit substituting the signed32 index view.");
+                }
+            }
             Assert.That(branch.OpCode,Is.EqualTo(OpCode.Jump));Assert.That(branch.Operands[0],Is.SameAs(success));
             graph.RemoveUnreachableBlocks();DeadCodeEliminator.Run(graph);
             Assert.That(graph.Instructions.Contains(allocation),Is.False);

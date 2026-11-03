@@ -32,14 +32,14 @@ public static class NativePublicFieldAccessorRecovery
     {
         if(app.Metadata.BaseStream is not MemoryStream metadata || !Convert.ToHexString(SHA256.HashData(metadata.ToArray()))
             .Equals("78e2ee2e6738511c08c9a0c0bdc1304c8d4f21740dc19958bb8b6690cfe3140e",StringComparison.OrdinalIgnoreCase))return new();
-        var candidates=new Dictionary<FieldAnalysisContext,List<Contract>>();var binary=app.Binary;
+        var candidates=new Dictionary<FieldAnalysisContext,List<Contract>>();
+        var properties=new Dictionary<FieldAnalysisContext,List<Contract>>();var binary=app.Binary;
         foreach(var target in app.MethodsByAddress.Values.SelectMany(v=>v).Distinct())
         {
             if(target.DeclaringType is not {IsValueType:false} owner || target.IsStatic || target.IsVirtual
                 || target.Visibility!=MethodAttributes.Public || target.Parameters.Count!=0 || target.IsVoid
                 || target.GenericParameters.Count!=0 || owner.IsGenericInstance || owner.GenericParameters.Count!=0
                 || target.Name.StartsWith(".",StringComparison.Ordinal)
-                || owner.Properties.Any(p=>ReferenceEquals(p.Getter,target))
                 || target.UnderlyingPointer==0 || target.UnderlyingPointer%4!=0
                 || !binary.TryMapVirtualAddressToRaw(target.UnderlyingPointer,out var raw)
                 || raw<0 || raw>binary.RawLength-8
@@ -47,27 +47,56 @@ public static class NativePublicFieldAccessorRecovery
             var code=binary.GetRawBinaryContent().Slice((int)raw,8);
             foreach(var field in owner.Fields)
             {
-                if(!TryContract(target,field,code,out var width))continue;
-                if(!candidates.TryGetValue(field,out var list))candidates[field]=list=[];
+                var isProperty=owner.Properties.Any(p=>ReferenceEquals(p.Getter,target));
+                int width;
+                if(isProperty ? !TryPropertyContract(target,field,code,out width) : !TryContract(target,field,code,out width))continue;
+                var destination=isProperty?properties:candidates;
+                if(!destination.TryGetValue(field,out var list))destination[field]=list=[];
                 list.Add(new(target,width));
             }
         }
         // Multiple public API identities stay unresolved rather than choosing
         // an arbitrary overload/name. The exact native field is the map key.
-        return candidates.Where(p=>p.Value.Count==1).ToDictionary(p=>p.Key,p=>p.Value[0]);
+        return SelectContracts(candidates,properties);
+    }
+
+    internal static Dictionary<FieldAnalysisContext,Contract> SelectContracts(
+        IReadOnlyDictionary<FieldAnalysisContext,List<Contract>> methods,
+        IReadOnlyDictionary<FieldAnalysisContext,List<Contract>> properties)
+    {
+        var result=methods.Where(p=>p.Value.Count==1).ToDictionary(p=>p.Key,p=>p.Value[0]);
+        // Preserve every existing method decision, including unresolved ambiguity.
+        foreach(var pair in properties)
+            if(!methods.ContainsKey(pair.Key) && pair.Value.Count==1)result.Add(pair.Key,pair.Value[0]);
+        return result;
     }
 
     internal static bool TryContract(MethodAnalysisContext target,FieldAnalysisContext field,ReadOnlySpan<byte> code,out int width)
+        => Prove(target,field,code,false,out width);
+
+    internal static bool TryPropertyContract(MethodAnalysisContext target,FieldAnalysisContext field,ReadOnlySpan<byte> code,out int width)
+        => Prove(target,field,code,true,out width);
+
+    private static bool Prove(MethodAnalysisContext target,FieldAnalysisContext field,ReadOnlySpan<byte> code,bool property,out int width)
     {
         width=0;
         if(code.Length!=8 || BitConverter.ToUInt32(code[4..])!=0xd65f03c0u
             || target.DeclaringType is not {IsValueType:false} owner || target.IsStatic || target.IsVirtual || target.IsVoid
             || target.Visibility!=MethodAttributes.Public || target.Parameters.Count!=0 || target.GenericParameters.Count!=0
             || owner.IsGenericInstance || owner.GenericParameters.Count!=0 || target.Name.StartsWith(".",StringComparison.Ordinal)
-            || owner.Properties.Any(p=>ReferenceEquals(p.Getter,target))
             || !ReferenceEquals(field.DeclaringType,owner) || !owner.Fields.Contains(field) || field.IsStatic
             || (field.Attributes&FieldAttributes.Literal)!=0 || field.Offset<16
             || !TrivialConstructorRecovery.SameType(field.FieldType,target.ReturnType))return false;
+        var associations=owner.Properties.Where(p=>ReferenceEquals(p.Getter,target)).ToArray();
+        if(property)
+        {
+            // Metadata association and exact original native effect are both required.
+            // Never publicize storage or invent an accessor from a naming convention.
+            if(field.Visibility!=FieldAttributes.Private || associations.Length!=1
+                || !ReferenceEquals(associations[0].DeclaringType,owner)
+                || !TrivialConstructorRecovery.SameType(associations[0].PropertyType,target.ReturnType))return false;
+        }
+        else if(associations.Length!=0)return false;
         var returned=target.ReturnType;var scalar=returned.IsEnumType?returned.EnumUnderlyingType:returned;
         if(scalar==null)return false;
         var (encoding,bytes)=scalar.FullName switch {
